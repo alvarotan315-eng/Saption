@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Saption</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0 auto;font-family:system-ui,sans-serif;background:#0f1115;color:#eee;padding:16px;max-width:520px}
+h1{margin:0 0 4px}
+p.sub{margin:0 0 16px;color:#9aa}
+label{display:block;margin:12px 0 4px;font-size:14px;color:#bbb}
+select,input[type=file],button{width:100%;padding:12px;border-radius:10px;border:1px solid #333;background:#1b1f27;color:#eee;font-size:16px}
+button{background:#6c5ce7;border:0;font-weight:600;margin-top:14px}
+button:disabled{opacity:.5}
+#bar{height:8px;background:#222;border-radius:4px;margin-top:12px;overflow:hidden;display:none}
+#fill{height:100%;width:0;background:#6c5ce7;transition:width .2s}
+#status{margin-top:8px;font-size:14px;color:#9aa;min-height:20px}
+#wrap{position:relative;margin-top:16px;display:none}
+video{width:100%;border-radius:10px;background:#000;max-height:60vh}
+#cap{position:absolute;left:8px;right:8px;bottom:16%;text-align:center;font-weight:700;font-size:18px;color:#fff;text-shadow:0 0 4px #000,0 0 4px #000,0 0 6px #000;pointer-events:none}
+.cue{margin-top:8px}
+.cue small{color:#789}
+.cue input{width:100%;padding:10px;border-radius:8px;border:1px solid #333;background:#1b1f27;color:#eee;font-size:15px}
+#dl{display:none;background:#00b894}
+</style>
+</head>
+<body>
+<h1>Saption</h1>
+<p class="sub">Subtitle otomatis untuk video pendek</p>
+
+<label>Pilih video</label>
+<input type="file" id="file" accept="video/*">
+
+<label>Bahasa dalam video</label>
+<select id="lang">
+  <option value="indonesian">Indonesia</option>
+  <option value="english">English</option>
+</select>
+
+<label>Mode</label>
+<select id="model">
+  <option value="Xenova/whisper-tiny">Cepat (lebih ringan)</option>
+  <option value="Xenova/whisper-base">Akurat (lebih lambat)</option>
+</select>
+
+<button id="go">Buat Subtitle</button>
+<div id="bar"><div id="fill"></div></div>
+<div id="status"></div>
+
+<div id="wrap">
+  <video id="vid" controls playsinline></video>
+  <div id="cap"></div>
+</div>
+
+<div id="list"></div>
+<button id="dl">Unduh Subtitle (.srt)</button>
+
+<script type="module">
+import { pipeline } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.2";
+
+const $ = id => document.getElementById(id);
+let cues = [], videoURL = null, asr = null, asrModel = null;
+
+const setStatus = t => { $("status").textContent = t; };
+const setBar = p => { $("bar").style.display = "block"; $("fill").style.width = p + "%"; };
+
+const pad = (n, l = 2) => String(n).padStart(l, "0");
+function ts(sec) {
+  const ms = Math.round(sec * 1000);
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  return pad(h) + ":" + pad(m) + ":" + pad(s) + "," + pad(ms % 1000, 3);
+}
+
+$("file").addEventListener("change", e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  if (videoURL) URL.revokeObjectURL(videoURL);
+  videoURL = URL.createObjectURL(f);
+  $("vid").src = videoURL;
+  $("wrap").style.display = "block";
+});
+
+async function getAudio(file) {
+  const ctx = new AudioContext({ sampleRate: 16000 });
+  const buf = await ctx.decodeAudioData(await file.arrayBuffer());
+  const ch = buf.numberOfChannels;
+  const out = new Float32Array(buf.length);
+  for (let c = 0; c < ch; c++) {
+    const d = buf.getChannelData(c);
+    for (let i = 0; i < d.length; i++) out[i] += d[i] / ch;
+  }
+  ctx.close();
+  return out;
+}
+
+async function loadModel(name) {
+  if (asr && asrModel === name) return asr;
+  asr = await pipeline("automatic-speech-recognition", name, {
+    progress_callback: p => {
+      if (p.status === "progress") {
+        setBar(p.progress);
+        setStatus("Mengunduh model AI... " + Math.round(p.progress) + "%");
+      }
+    }
+  });
+  asrModel = name;
+  return asr;
+}
+
+function group(words) {
+  const out = [];
+  let cur = null;
+  words.forEach((w, i) => {
+    const text = w.text.trim();
+    if (!text) return;
+    const s = w.timestamp[0] ?? (out.length ? out[out.length - 1].end : 0);
+    let e = w.timestamp[1];
+    if (e == null) {
+      const nx = words[i + 1];
+      e = nx && nx.timestamp[0] != null ? nx.timestamp[0] : s + 0.6;
+    }
+    if (cur && s - cur.end > 0.8) { out.push(cur); cur = null; }
+    if (!cur) cur = { start: s, end: e, text: text };
+    else { cur.text += " " + text; cur.end = e; }
+    const n = cur.text.split(" ").length;
+    if (n >= 5 || /[.!?]$/.test(text) || (n >= 3 && /,$/.test(text))) {
+      out.push(cur);
+      cur = null;
+    }
+  });
+  if (cur) out.push(cur);
+  return out;
+}
+
+function render() {
+  const box = $("list");
+  box.innerHTML = "";
+  cues.forEach(c => {
+    const d = document.createElement("div");
+    d.className = "cue";
+    const small = document.createElement("small");
+    small.textContent = ts(c.start) + " → " + ts(c.end);
+    const inp = document.createElement("input");
+    inp.value = c.text;
+    inp.oninput = () => { c.text = inp.value; };
+    d.appendChild(small);
+    d.appendChild(inp);
+    box.appendChild(d);
+  });
+  $("dl").style.display = cues.length ? "block" : "none";
+  setStatus(cues.length ? "Selesai! " + cues.length + " baris subtitle." : "Tidak ada suara yang terdeteksi.");
+}
+
+$("go").addEventListener("click", async () => {
+  const f = $("file").files[0];
+  if (!f) return setStatus("Pilih video dulu.");
+  $("go").disabled = true;
+  $("dl").style.display = "none";
+  $("list").innerHTML = "";
+  cues = [];
+  try {
+    setStatus("Menyiapkan model AI...");
+    const model = await loadModel($("model").value);
+    setBar(100);
+    setStatus("Membaca suara dari video...");
+    const audio = await getAudio(f);
+    setStatus("Membuat subtitle... (bisa beberapa menit, jangan tutup halaman)");
+    const res = await model(audio, {
+      language: $("lang").value,
+      task: "transcribe",
+      return_timestamps: "word",
+      chunk_length_s: 30,
+      stride_length_s: 5
+    });
+    cues = group(res.chunks);
+    render();
+  } catch (err) {
+    setStatus("Gagal: " + err.message);
+  }
+  $("go").disabled = false;
+});
+
+$("vid").addEventListener("timeupdate", () => {
+  const t = $("vid").currentTime;
+  const c = cues.find(x => t >= x.start && t <= x.end);
+  $("cap").textContent = c ? c.text : "";
+});
+
+$("dl").addEventListener("click", () => {
+  const srt = cues
+    .map((c, i) => (i + 1) + "\n" + ts(c.start) + " --> " + ts(c.end) + "\n" + c.text + "\n")
+    .join("\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([srt], { type: "text/plain" }));
+  a.download = "saption.srt";
+  a.click();
+});
+</script>
+</body>
+</html>
